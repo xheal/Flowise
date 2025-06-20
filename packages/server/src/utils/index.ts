@@ -5,6 +5,7 @@
 import path from 'path'
 import fs from 'fs'
 import logger from './logger'
+import { v4 as uuidv4 } from 'uuid'
 import {
     IChatFlow,
     IComponentCredentials,
@@ -63,11 +64,14 @@ import {
     SecretsManagerClient,
     SecretsManagerClientConfig
 } from '@aws-sdk/client-secrets-manager'
+import { checkStorage, updateStorageUsage } from './quotaUsage'
+import { UsageCacheManager } from '../UsageCacheManager'
 
 export const QUESTION_VAR_PREFIX = 'question'
 export const FILE_ATTACHMENT_PREFIX = 'file_attachment'
 export const CHAT_HISTORY_VAR_PREFIX = 'chat_history'
 export const RUNTIME_MESSAGES_LENGTH_VAR_PREFIX = 'runtime_messages_length'
+export const CURRENT_DATE_TIME_VAR_PREFIX = 'current_date_time'
 export const REDACTED_CREDENTIAL_VALUE = '_FLOWISE_BLANK_07167752-1a71-43b1-bf8f-4f32252165db'
 
 let secretsManagerClient: SecretsManagerClient | null = null
@@ -204,6 +208,22 @@ export const constructGraphs = (
 }
 
 /**
+ * Get starting node and check if flow is valid
+ * @param {INodeDependencies} nodeDependencies
+ */
+export const getStartingNode = (nodeDependencies: INodeDependencies) => {
+    // Find starting node
+    const startingNodeIds = [] as string[]
+    Object.keys(nodeDependencies).forEach((nodeId) => {
+        if (nodeDependencies[nodeId] === 0) {
+            startingNodeIds.push(nodeId)
+        }
+    })
+
+    return { startingNodeIds }
+}
+
+/**
  * Get starting nodes and check if flow is valid
  * @param {INodeDependencies} graph
  * @param {string} endNodeId
@@ -237,22 +257,6 @@ export const getStartingNodes = (graph: INodeDirectedGraph, endNodeId: string) =
         .map(([id, _]) => id)
 
     return { startingNodeIds, depthQueue: depthQueueReversed }
-}
-
-/**
- * Get starting node and check if flow is valid
- * @param {INodeDependencies} nodeDependencies
- */
-export const getStartingNode = (nodeDependencies: INodeDependencies) => {
-    // Find starting node
-    const startingNodeIds = [] as string[]
-    Object.keys(nodeDependencies).forEach((nodeId) => {
-        if (nodeDependencies[nodeId] === 0) {
-            startingNodeIds.push(nodeId)
-        }
-    })
-
-    return { startingNodeIds }
 }
 
 /**
@@ -497,6 +501,10 @@ type BuildFlowParams = {
     stopNodeId?: string
     uploads?: IFileUpload[]
     baseURL?: string
+    orgId?: string
+    workspaceId?: string
+    subscriptionId?: string
+    usageCacheManager?: UsageCacheManager
     uploadedFilesContent?: string
 }
 
@@ -528,7 +536,11 @@ export const buildFlow = async ({
     isUpsert,
     stopNodeId,
     uploads,
-    baseURL
+    baseURL,
+    orgId,
+    workspaceId,
+    subscriptionId,
+    usageCacheManager
 }: BuildFlowParams) => {
     const flowNodes = cloneDeep(reactFlowNodes)
 
@@ -591,8 +603,11 @@ export const buildFlow = async ({
             )
 
             if (isUpsert && stopNodeId && nodeId === stopNodeId) {
-                logger.debug(`[server]: Upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 const indexResult = await newNodeInstance.vectorStoreMethods!['upsert']!.call(newNodeInstance, reactFlowNodeData, {
+                    orgId,
+                    workspaceId,
+                    subscriptionId,
                     chatId,
                     sessionId,
                     chatflowid,
@@ -602,12 +617,13 @@ export const buildFlow = async ({
                     appDataSource,
                     databaseEntities,
                     cachePool,
+                    usageCacheManager,
                     dynamicVariables,
                     uploads,
                     baseURL
                 })
                 if (indexResult) upsertHistory['result'] = indexResult
-                logger.debug(`[server]: Finished upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Finished upserting ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 break
             } else if (
                 !isUpsert &&
@@ -616,9 +632,12 @@ export const buildFlow = async ({
             ) {
                 initializedNodes.add(nodeId)
             } else {
-                logger.debug(`[server]: Initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 const finalQuestion = uploadedFilesContent ? `${uploadedFilesContent}\n\n${question}` : question
                 let outputResult = await newNodeInstance.init(reactFlowNodeData, finalQuestion, {
+                    orgId,
+                    workspaceId,
+                    subscriptionId,
                     chatId,
                     sessionId,
                     chatflowid,
@@ -627,11 +646,14 @@ export const buildFlow = async ({
                     appDataSource,
                     databaseEntities,
                     cachePool,
+                    usageCacheManager,
                     isUpsert,
                     dynamicVariables,
                     uploads,
                     baseURL,
-                    componentNodes: componentNodes as ICommonObject
+                    componentNodes,
+                    updateStorageUsage,
+                    checkStorage
                 })
 
                 // Save dynamic variables
@@ -676,11 +698,11 @@ export const buildFlow = async ({
 
                 flowNodes[nodeIndex].data.instance = outputResult
 
-                logger.debug(`[server]: Finished initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
+                logger.debug(`[server]: [${orgId}]: Finished initializing ${reactFlowNode.data.label} (${reactFlowNode.data.id})`)
                 initializedNodes.add(reactFlowNode.data.id)
             }
         } catch (e: any) {
-            logger.error(e)
+            logger.error(`[server]: [${orgId}]:`, e)
             throw new Error(e)
         }
 
@@ -744,6 +766,7 @@ export const clearSessionMemory = async (
     componentNodes: IComponentNodes,
     chatId: string,
     appDataSource: DataSource,
+    orgId?: string,
     sessionId?: string,
     memoryType?: string,
     isClearFromViewMessageDialog?: string
@@ -757,7 +780,7 @@ export const clearSessionMemory = async (
         const nodeInstanceFilePath = componentNodes[node.data.name].filePath as string
         const nodeModule = await import(nodeInstanceFilePath)
         const newNodeInstance = new nodeModule.nodeClass()
-        const options: ICommonObject = { chatId, appDataSource, databaseEntities, logger }
+        const options: ICommonObject = { orgId, chatId, appDataSource, databaseEntities, logger }
 
         // SessionId always take priority first because it is the sessionId used for 3rd party memory node
         if (sessionId && node.data.inputs) {
@@ -1261,7 +1284,6 @@ export const findAvailableConfigs = (reactFlowNodes: IReactFlowNode[], component
     for (const flowNode of reactFlowNodes) {
         for (const inputParam of flowNode.data.inputParams) {
             let obj: IOverrideConfig | undefined
-
             if (inputParam.type === 'file') {
                 obj = {
                     node: flowNode.data.label,
@@ -1500,7 +1522,6 @@ export const decryptCredentialData = async (
 
     if (USE_AWS_SECRETS_MANAGER && secretsManagerClient) {
         try {
-            logger.info(`[server]: Reading AWS Secret: ${encryptedData}`)
             if (encryptedData.startsWith('FlowiseCredential_')) {
                 const command = new GetSecretValueCommand({ SecretId: encryptedData })
                 const response = await secretsManagerClient.send(command)
@@ -1566,6 +1587,10 @@ export const transformToCredentialEntity = async (body: ICredentialReqBody): Pro
 
     const newCredential = new Credential()
     Object.assign(newCredential, credentialBody)
+
+    if (body.workspaceId) {
+        newCredential.workspaceId = body.workspaceId
+    }
 
     return newCredential
 }
@@ -1735,21 +1760,6 @@ export const getTelemetryFlowObj = (nodes: IReactFlowNode[], edges: IReactFlowEd
 }
 
 /**
- * Get user settings file
- * TODO: move env variables to settings json file, easier configuration
- */
-export const getUserSettingsFilePath = () => {
-    if (process.env.SECRETKEY_PATH) return path.join(process.env.SECRETKEY_PATH, 'settings.json')
-    const checkPaths = [path.join(getUserHome(), '.flowise', 'settings.json')]
-    for (const checkPath of checkPaths) {
-        if (fs.existsSync(checkPath)) {
-            return checkPath
-        }
-    }
-    return ''
-}
-
-/**
  * Get app current version
  */
 export const getAppVersion = async () => {
@@ -1815,14 +1825,8 @@ export const getUploadPath = (): string => {
         : path.join(getUserHome(), '.flowise', 'uploads')
 }
 
-const getOrgId = () => {
-    const settingsContent = fs.readFileSync(getUserSettingsFilePath(), 'utf8')
-    try {
-        const settings = JSON.parse(settingsContent)
-        return settings.instanceId
-    } catch (error) {
-        return ''
-    }
+export function generateId() {
+    return uuidv4()
 }
 
 export const getMulterStorage = () => {
@@ -1837,10 +1841,10 @@ export const getMulterStorage = () => {
                 s3: s3Client,
                 bucket: Bucket,
                 metadata: function (req, file, cb) {
-                    cb(null, { fieldName: file.fieldname, originalName: file.originalname, orgId: getOrgId() })
+                    cb(null, { fieldName: file.fieldname, originalName: file.originalname })
                 },
                 key: function (req, file, cb) {
-                    cb(null, `${getOrgId()}/${Date.now().toString()}`)
+                    cb(null, `${generateId()}`)
                 }
             })
         })
@@ -1852,7 +1856,7 @@ export const getMulterStorage = () => {
                 bucket: process.env.GOOGLE_CLOUD_STORAGE_BUCKET_NAME,
                 keyFilename: process.env.GOOGLE_CLOUD_STORAGE_CREDENTIAL,
                 uniformBucketLevelAccess: Boolean(process.env.GOOGLE_CLOUD_UNIFORM_BUCKET_ACCESS) ?? true,
-                destination: `uploads/${getOrgId()}`
+                destination: `uploads/${generateId()}`
             })
         })
     } else {

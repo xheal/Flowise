@@ -15,7 +15,7 @@ import { AnalyticHandler } from '../../../src/handler'
 import { DEFAULT_SUMMARIZER_TEMPLATE } from '../prompt'
 import { ILLMMessage } from '../Interface.Agentflow'
 import { Tool } from '@langchain/core/tools'
-import { ARTIFACTS_PREFIX, SOURCE_DOCUMENTS_PREFIX } from '../../../src/agents'
+import { ARTIFACTS_PREFIX, SOURCE_DOCUMENTS_PREFIX, TOOL_ARGS_PREFIX } from '../../../src/agents'
 import { flatten } from 'lodash'
 import zodToJsonSchema from 'zod-to-json-schema'
 import { getErrorMessage } from '../../../src/error'
@@ -427,7 +427,8 @@ class Agent_Agentflow implements INode {
                 return returnData
             }
 
-            const stores = await appDataSource.getRepository(databaseEntities['DocumentStore']).find()
+            const searchOptions = options.searchOptions || {}
+            const stores = await appDataSource.getRepository(databaseEntities['DocumentStore']).findBy(searchOptions)
             for (const store of stores) {
                 if (store.status === 'UPSERTED') {
                     const obj = {
@@ -495,18 +496,21 @@ class Agent_Agentflow implements INode {
                     }
                 }
                 const toolInstance = await newToolNodeInstance.init(newNodeData, '', options)
-                if (tool.agentSelectedToolRequiresHumanInput) {
-                    toolInstance.requiresHumanInput = true
-                }
 
                 // toolInstance might returns a list of tools like MCP tools
                 if (Array.isArray(toolInstance)) {
                     for (const subTool of toolInstance) {
                         const subToolInstance = subTool as Tool
                         ;(subToolInstance as any).agentSelectedTool = tool.agentSelectedTool
+                        if (tool.agentSelectedToolRequiresHumanInput) {
+                            ;(subToolInstance as any).requiresHumanInput = true
+                        }
                         toolsInstance.push(subToolInstance)
                     }
                 } else {
+                    if (tool.agentSelectedToolRequiresHumanInput) {
+                        toolInstance.requiresHumanInput = true
+                    }
                     toolsInstance.push(toolInstance as Tool)
                 }
             }
@@ -755,7 +759,7 @@ class Agent_Agentflow implements INode {
                 /*
                  * If this is the first node:
                  * - Add images to messages if exist
-                 * - Add user message
+                 * - Add user message if it does not exist in the agentMessages array
                  */
                 if (options.uploads) {
                     const imageContents = await getUniqueImageMessages(options, messages, modelConfig)
@@ -766,7 +770,7 @@ class Agent_Agentflow implements INode {
                     }
                 }
 
-                if (input && typeof input === 'string') {
+                if (input && typeof input === 'string' && !agentMessages.some((msg) => msg.role === 'user')) {
                     messages.push({
                         role: 'user',
                         content: input
@@ -928,7 +932,14 @@ class Agent_Agentflow implements INode {
             }
 
             // Prepare final response and output object
-            const finalResponse = (response.content as string) ?? JSON.stringify(response, null, 2)
+            let finalResponse = ''
+            if (response.content && Array.isArray(response.content)) {
+                finalResponse = response.content.map((item: any) => item.text).join('\n')
+            } else if (response.content && typeof response.content === 'string') {
+                finalResponse = response.content
+            } else {
+                finalResponse = JSON.stringify(response, null, 2)
+            }
             const output = this.prepareOutputObject(
                 response,
                 availableTools,
@@ -976,7 +987,19 @@ class Agent_Agentflow implements INode {
                     inputMessages.push(...runtimeImageMessagesWithFileRef)
                 }
                 if (input && typeof input === 'string') {
-                    inputMessages.push({ role: 'user', content: input })
+                    if (!enableMemory) {
+                        if (!agentMessages.some((msg) => msg.role === 'user')) {
+                            inputMessages.push({ role: 'user', content: input })
+                        } else {
+                            agentMessages.map((msg) => {
+                                if (msg.role === 'user') {
+                                    inputMessages.push({ role: 'user', content: msg.content })
+                                }
+                            })
+                        }
+                    } else {
+                        inputMessages.push({ role: 'user', content: input })
+                    }
                 }
             }
 
@@ -1361,6 +1384,7 @@ class Agent_Agentflow implements INode {
         const usedTools: IUsedTool[] = []
         let sourceDocuments: Array<any> = []
         let artifacts: any[] = []
+        let isWaitingForHumanInput: boolean | undefined
 
         // Process each tool call
         for (let i = 0; i < response.tool_calls.length; i++) {
@@ -1388,9 +1412,18 @@ class Agent_Agentflow implements INode {
                     return { response, usedTools, sourceDocuments, artifacts, totalTokens, isWaitingForHumanInput: true }
                 }
 
+                let toolIds: ICommonObject | undefined
+                if (options.analyticHandlers) {
+                    toolIds = await options.analyticHandlers.onToolStart(toolCall.name, toolCall.args, options.parentTraceIds)
+                }
+
                 try {
                     //@ts-ignore
                     let toolOutput = await selectedTool.call(toolCall.args, { signal: abortController?.signal }, undefined, flowConfig)
+
+                    if (options.analyticHandlers && toolIds) {
+                        await options.analyticHandlers.onToolEnd(toolIds, toolOutput)
+                    }
 
                     // Extract source documents if present
                     if (typeof toolOutput === 'string' && toolOutput.includes(SOURCE_DOCUMENTS_PREFIX)) {
@@ -1416,6 +1449,17 @@ class Agent_Agentflow implements INode {
                         }
                     }
 
+                    let toolInput
+                    if (typeof toolOutput === 'string' && toolOutput.includes(TOOL_ARGS_PREFIX)) {
+                        const [output, args] = toolOutput.split(TOOL_ARGS_PREFIX)
+                        toolOutput = output
+                        try {
+                            toolInput = JSON.parse(args)
+                        } catch (e) {
+                            console.error('Error parsing tool input from tool:', e)
+                        }
+                    }
+
                     // Add tool message to conversation
                     messages.push({
                         role: 'tool',
@@ -1431,10 +1475,14 @@ class Agent_Agentflow implements INode {
                     // Track used tools
                     usedTools.push({
                         tool: toolCall.name,
-                        toolInput: toolCall.args,
+                        toolInput: toolInput ?? toolCall.args,
                         toolOutput
                     })
                 } catch (e) {
+                    if (options.analyticHandlers && toolIds) {
+                        await options.analyticHandlers.onToolEnd(toolIds, e)
+                    }
+
                     console.error('Error invoking tool:', e)
                     usedTools.push({
                         tool: selectedTool.name,
@@ -1442,6 +1490,8 @@ class Agent_Agentflow implements INode {
                         toolOutput: '',
                         error: getErrorMessage(e)
                     })
+                    sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
+                    throw new Error(getErrorMessage(e))
                 }
             }
         }
@@ -1497,7 +1547,8 @@ class Agent_Agentflow implements INode {
                 usedTools: recursiveUsedTools,
                 sourceDocuments: recursiveSourceDocuments,
                 artifacts: recursiveArtifacts,
-                totalTokens: recursiveTokens
+                totalTokens: recursiveTokens,
+                isWaitingForHumanInput: recursiveIsWaitingForHumanInput
             } = await this.handleToolCalls({
                 response: newResponse,
                 messages,
@@ -1519,9 +1570,10 @@ class Agent_Agentflow implements INode {
             sourceDocuments = [...sourceDocuments, ...recursiveSourceDocuments]
             artifacts = [...artifacts, ...recursiveArtifacts]
             totalTokens += recursiveTokens
+            isWaitingForHumanInput = recursiveIsWaitingForHumanInput
         }
 
-        return { response: newResponse, usedTools, sourceDocuments, artifacts, totalTokens }
+        return { response: newResponse, usedTools, sourceDocuments, artifacts, totalTokens, isWaitingForHumanInput }
     }
 
     /**
@@ -1621,12 +1673,28 @@ class Agent_Agentflow implements INode {
 
                 if (humanInput.type === 'reject') {
                     messages.pop()
-                    toolsInstance = toolsInstance.filter((tool) => tool.name !== toolCall.name)
+                    const toBeRemovedTool = toolsInstance.find((tool) => tool.name === toolCall.name)
+                    if (toBeRemovedTool) {
+                        toolsInstance = toolsInstance.filter((tool) => tool.name !== toolCall.name)
+                        // Remove other tools with the same agentSelectedTool such as MCP tools
+                        toolsInstance = toolsInstance.filter(
+                            (tool) => (tool as any).agentSelectedTool !== (toBeRemovedTool as any).agentSelectedTool
+                        )
+                    }
                 }
                 if (humanInput.type === 'proceed') {
+                    let toolIds: ICommonObject | undefined
+                    if (options.analyticHandlers) {
+                        toolIds = await options.analyticHandlers.onToolStart(toolCall.name, toolCall.args, options.parentTraceIds)
+                    }
+
                     try {
                         //@ts-ignore
                         let toolOutput = await selectedTool.call(toolCall.args, { signal: abortController?.signal }, undefined, flowConfig)
+
+                        if (options.analyticHandlers && toolIds) {
+                            await options.analyticHandlers.onToolEnd(toolIds, toolOutput)
+                        }
 
                         // Extract source documents if present
                         if (typeof toolOutput === 'string' && toolOutput.includes(SOURCE_DOCUMENTS_PREFIX)) {
@@ -1652,6 +1720,17 @@ class Agent_Agentflow implements INode {
                             }
                         }
 
+                        let toolInput
+                        if (typeof toolOutput === 'string' && toolOutput.includes(TOOL_ARGS_PREFIX)) {
+                            const [output, args] = toolOutput.split(TOOL_ARGS_PREFIX)
+                            toolOutput = output
+                            try {
+                                toolInput = JSON.parse(args)
+                            } catch (e) {
+                                console.error('Error parsing tool input from tool:', e)
+                            }
+                        }
+
                         // Add tool message to conversation
                         messages.push({
                             role: 'tool',
@@ -1667,10 +1746,14 @@ class Agent_Agentflow implements INode {
                         // Track used tools
                         usedTools.push({
                             tool: toolCall.name,
-                            toolInput: toolCall.args,
+                            toolInput: toolInput ?? toolCall.args,
                             toolOutput
                         })
                     } catch (e) {
+                        if (options.analyticHandlers && toolIds) {
+                            await options.analyticHandlers.onToolEnd(toolIds, e)
+                        }
+
                         console.error('Error invoking tool:', e)
                         usedTools.push({
                             tool: selectedTool.name,
@@ -1678,6 +1761,8 @@ class Agent_Agentflow implements INode {
                             toolOutput: '',
                             error: getErrorMessage(e)
                         })
+                        sseStreamer?.streamUsedToolsEvent(chatId, flatten(usedTools))
+                        throw new Error(getErrorMessage(e))
                     }
                 }
             }

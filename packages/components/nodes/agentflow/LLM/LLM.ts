@@ -262,6 +262,7 @@ class LLM_Agentflow implements INode {
 }`,
                         description: 'JSON schema for the structured output',
                         optional: true,
+                        hideCodeExecute: true,
                         show: {
                             'llmStructuredOutput[$index].type': 'jsonArray'
                         }
@@ -410,7 +411,7 @@ class LLM_Agentflow implements INode {
                 /*
                  * If this is the first node:
                  * - Add images to messages if exist
-                 * - Add user message
+                 * - Add user message if it does not exist in the llmMessages array
                  */
                 if (options.uploads) {
                     const imageContents = await getUniqueImageMessages(options, messages, modelConfig)
@@ -421,7 +422,7 @@ class LLM_Agentflow implements INode {
                     }
                 }
 
-                if (input && typeof input === 'string') {
+                if (input && typeof input === 'string' && !llmMessages.some((msg) => msg.role === 'user')) {
                     messages.push({
                         role: 'user',
                         content: input
@@ -486,8 +487,15 @@ class LLM_Agentflow implements INode {
             }
 
             // Prepare final response and output object
-            const finalResponse = (response.content as string) ?? JSON.stringify(response, null, 2)
-            const output = this.prepareOutputObject(response, finalResponse, startTime, endTime, timeDelta)
+            let finalResponse = ''
+            if (response.content && Array.isArray(response.content)) {
+                finalResponse = response.content.map((item: any) => item.text).join('\n')
+            } else if (response.content && typeof response.content === 'string') {
+                finalResponse = response.content
+            } else {
+                finalResponse = JSON.stringify(response, null, 2)
+            }
+            const output = this.prepareOutputObject(response, finalResponse, startTime, endTime, timeDelta, isStructuredOutput)
 
             // End analytics tracking
             if (analyticHandlers && llmIds) {
@@ -545,7 +553,19 @@ class LLM_Agentflow implements INode {
                     inputMessages.push(...runtimeImageMessagesWithFileRef)
                 }
                 if (input && typeof input === 'string') {
-                    inputMessages.push({ role: 'user', content: input })
+                    if (!enableMemory) {
+                        if (!llmMessages.some((msg) => msg.role === 'user')) {
+                            inputMessages.push({ role: 'user', content: input })
+                        } else {
+                            llmMessages.map((msg) => {
+                                if (msg.role === 'user') {
+                                    inputMessages.push({ role: 'user', content: msg.content })
+                                }
+                            })
+                        }
+                    } else {
+                        inputMessages.push({ role: 'user', content: input })
+                    }
                 }
             }
 
@@ -841,7 +861,8 @@ class LLM_Agentflow implements INode {
         finalResponse: string,
         startTime: number,
         endTime: number,
-        timeDelta: number
+        timeDelta: number,
+        isStructuredOutput: boolean
     ): any {
         const output: any = {
             content: finalResponse,
@@ -858,6 +879,15 @@ class LLM_Agentflow implements INode {
 
         if (response.usage_metadata) {
             output.usageMetadata = response.usage_metadata
+        }
+
+        if (isStructuredOutput && typeof response === 'object') {
+            const structuredOutput = response as Record<string, any>
+            for (const key in structuredOutput) {
+                if (structuredOutput[key]) {
+                    output[key] = structuredOutput[key]
+                }
+            }
         }
 
         return output
